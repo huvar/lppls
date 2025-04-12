@@ -109,65 +109,97 @@ class LPPLS(object):
 
         return np.linalg.solve(matrix_1, matrix_2)
 
+
     def fit(self, max_searches, minimizer="Nelder-Mead", obs=None):
         """
+        Fits the LPPLS model to the observations using multiple random seeds.
+
+        MODIFIED: Now returns sse and residuals from estimate_params.
+
         Args:
-            max_searches (int): The maxi amount of searches to perform before giving up. The literature suggests 25.
-            minimizer (str): See list of valid methods to pass to scipy.optimize.minimize:
-                https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.minimize.html#scipy.optimize.minimize
-            obs (Mx2 numpy array): the observed time-series data. Optional, if not included will use self.scaled_obs
+            max_searches (int): Max optimization attempts before giving up.
+            minimizer (str): Scipy optimization method.
+            obs (Mx2 numpy array): Observed time-series data. Uses self.observations if None.
+
         Returns:
-            tc, m, w, a, b, c, c1, c2, O, D
+            tuple: (tc, m, w, a, b, c, c1, c2, O, D, sse, residuals) on success,
+                   (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None) on failure.
+                   - O (float): Number of oscillations.
+                   - D (float): Damping factor.
+                   - sse (float/None): Sum of Squared Errors of the fit.
+                   - residuals (np.array/None): Array of residuals.
         """
         if obs is None:
             obs = self.observations
+        # Ensure obs has at least 2 data points for fitting
+        if obs.shape[1] < 2:
+             # print("Warning: Need at least 2 data points to fit.")
+             return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None
+
 
         search_count = 0
-        # find bubble
+        t1 = obs[0, 0]
+        t2 = obs[0, -1]
+
         while search_count < max_searches:
-            # tc_init_min, tc_init_max = self._get_tc_bounds(obs, 0.50, 0.50)
-            t1 = obs[0, 0]
-            t2 = obs[0, -1]
-
-            # @TODO make configurable
-            # set random initialization limits for non-linear params
+            # Set random initialization limits for non-linear params
             init_limits = [
-                # (tc_init_min, tc_init_max),
-                (t2 - 0.2 * (t2 - t1), t2 + 0.2 * (t2 - t1)),  # tc
-                (0.1, 1.0),  # m
-                (6.0, 13.0),  # ω
+                (t2 - 0.2 * (t2 - t1), t2 + 0.2 * (t2 - t1)), # tc
+                (0.1, 1.0),                                  # m
+                (6.0, 13.0),                                 # ω (Note: Original code default)
             ]
-
-            # randomly choose vals within bounds for non-linear params
-            non_lin_vals = [random.uniform(a[0], a[1]) for a in init_limits]
-
-            tc = non_lin_vals[0]
-            m = non_lin_vals[1]
-            w = non_lin_vals[2]
-            seed = np.array([tc, m, w])
-
-            # Increment search count on SVD convergence error, but raise all other exceptions.
+            # Randomly choose vals within bounds
             try:
-                tc, m, w, a, b, c, c1, c2 = self.estimate_params(obs, seed, minimizer)
-                O = self.get_oscillations(w, tc, t1, t2)
-                D = self.get_damping(m, w, b, c)
-                return tc, m, w, a, b, c, c1, c2, O, D
-            except Exception as e:
-                # print(e)
+                 tc_init = random.uniform(init_limits[0][0], init_limits[0][1])
+                 m_init = random.uniform(init_limits[1][0], init_limits[1][1])
+                 w_init = random.uniform(init_limits[2][0], init_limits[2][1])
+                 seed = np.array([tc_init, m_init, w_init])
+            except OverflowError:
+                 # Handle potential OverflowError if t1, t2, or tc are extremely large/small
+                 search_count += 1
+                 continue
+
+
+            try:
+                # Call estimate_params (modified to return sse, residuals)
+                tc, m, w, a, b, c, c1, c2, sse, residuals = self.estimate_params(obs, seed, minimizer)
+
+                # Calculate O and D safely
+                O = self.get_oscillations(w, tc, t1, t2) if tc not in [t1, t2] else np.nan
+                D = self.get_damping(m, w, b, c) if c != 0 and w != 0 else np.nan # Avoid division by zero
+
+                return tc, m, w, a, b, c, c1, c2, O, D, sse, residuals
+
+            except (ValueError, UnboundLocalError, np.linalg.LinAlgError) as e:
+                # Catch optimization failures or linear algebra errors
+                # print(f"Fit attempt {search_count + 1} failed: {e}")
                 search_count += 1
-        return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+            except Exception as e:
+                # Catch any other unexpected error during fitting
+                # print(f"Unexpected error during fit attempt {search_count + 1}: {e}")
+                search_count += 1 # Increment count to avoid infinite loop
+
+        # Return zeros/None if max_searches reached without success
+        return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None
 
     def estimate_params(self, observations, seed, minimizer):
         """
-        Args:
-            observations (np.ndarray):  the observed time-series data.
-            seed (list):  time-critical, omega, and m.
-            minimizer (str):  See list of valid methods to pass to scipy.optimize.minimize:
-                https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.minimize.html#scipy.optimize.minimize
-        Returns:
-            tc, m, w, a, b, c, c1, c2
-        """
+        Estimates LPPLS parameters using scipy.optimize.minimize.
 
+        MODIFIED: Now also calculates and returns SSE and residuals.
+
+        Args:
+            observations (np.ndarray): The observed time-series data slice (2xN).
+            seed (list): Initial guess for [tc, m, w].
+            minimizer (str): Minimization algorithm for scipy.optimize.minimize.
+
+        Returns:
+            tuple: (tc, m, w, a, b, c, c1, c2, sse, residuals) if successful,
+                   else raises UnboundLocalError or other optimization error.
+                   - sse (float): Sum of Squared Errors of the fit.
+                   - residuals (np.array): Array of residuals (obs - fit).
+        """
+        # Args observation slice is needed for residual calculation later
         cofs = minimize(
             args=observations, fun=self.func_restricted, x0=seed, method=minimizer
         )
@@ -176,21 +208,30 @@ class LPPLS(object):
             tc = cofs.x[0]
             m = cofs.x[1]
             w = cofs.x[2]
-            # r =
-            # m_f =
 
+            # Get linear params A, B, C1, C2
             rM = self.matrix_equation(observations, tc, m, w)
             a, b, c1, c2 = rM[:, 0].tolist()
 
-            c = self.get_c(c1, c2)
+            # Calculate derived param C
+            c = self.get_c(c1, c2) # Assuming self.get_c exists
 
-            # Use sklearn format for storing fit params
-            # @TODO only save when running single fits.
-            for coef in ["tc", "m", "w", "a", "b", "c", "c1", "c2"]:
-                self.coef_[coef] = eval(coef)
-            return tc, m, w, a, b, c, c1, c2
+            # --- NEW: Calculate SSE and Residuals ---
+            sse = cofs.fun # The final value of the objective function is the SSE
+            lppls_fit_values = self.lppls(observations[0, :], tc, m, w, a, b, c1, c2)
+            residuals = observations[1, :] - lppls_fit_values
+            # --------------------------------------
+
+            # Store coefficients if needed (original behavior)
+            # @TODO consider if this self.coef_ update is desired during multi-fits
+            # for coef in ["tc", "m", "w", "a", "b", "c", "c1", "c2"]:
+            #     self.coef_[coef] = eval(coef)
+
+            # Return parameters including sse and residuals
+            return tc, m, w, a, b, c, c1, c2, sse, residuals
         else:
-            raise UnboundLocalError
+            # Raise error if minimization failed
+            raise ValueError(f"Optimization failed: {cofs.message}")
 
     def plot_fit(self, show_tc=False):
         """
@@ -506,91 +547,71 @@ class LPPLS(object):
         )
 
     def _func_compute_nested_fits(self, args):
+        """
+        Internal helper function for mp_compute_nested_fits.
+        Computes LPPLS fits for shrinking windows within a given observation slice.
 
+        MODIFIED: Stores sse, residuals, and data indices in the result dict.
+        """
         (
-            obs,
-            window_size,
-            n_iter,
+            obs,              # The current outer window slice (2xN)
+            window_size,      # Original size of the outer window 'obs'
+            n_iter,           # The starting index of 'obs' in the *full* observations array
             smallest_window_size,
-            outer_increment,
+            outer_increment,  # Not used within this function directly
             inner_increment,
             max_searches,
         ) = args
 
         window_delta = window_size - smallest_window_size
+        res_inner = [] # Results for the nested fits of this outer window
 
-        res = []
+        # Outer window metadata
+        t1_outer = obs[0, 0]
+        t2_outer = obs[0, -1]
+        p2_outer = obs[1, -1]
 
-        # print('obs', obs)
-        t1 = obs[0][0]
-        t2 = obs[0][-1]
-        p1 = obs[1][0]
-        p2 = obs[1][-1]
-
-        # if self.scale_obs:
-        #     t1 = self.inverse_transform_observations([[t1, p1]])[0, 0]
-        #     t2 = self.inverse_transform_observations([[t2, p2]])[0, 0]
-        #     p1 = self.inverse_transform_observations([[t1, p1]])[0, 1]
-        #     p2 = self.inverse_transform_observations([[t2, p2]])[0, 1]
-
-        # tc_init_min, tc_init_max = self._get_tc_bounds(obs_shrinking_slice, tc_min, tc_max)
-        #
-        # tc_in_range = last - tc_init_min < tc < last + tc_init_max
-        # m_in_range = m_min < m < m_max
-        # w_in_range = w_min < w < w_max
-        # O_in_range = self._is_O_in_range(tc, w, last, O_min)
-        # D_in_range = self._is_D_in_range(m, w, b, c, D_min)
-        #
-        # qualified[value] = tc_in_range and m_in_range and w_in_range and O_in_range and D_in_range
-
-        # run n fits on the observation slice.
-        for j in range(0, window_delta, inner_increment):
+        # Loop through nested shrinking windows
+        # j is the number of points to shave off the beginning of the outer slice 'obs'
+        for j in range(0, window_delta + 1, inner_increment): # Go up to window_delta inclusive
+            # Define the shrinking slice for this nested fit
+            # Start index within 'obs' is j, end index is window_size (exclusive)
             obs_shrinking_slice = obs[:, j:window_size]
+            num_points_in_slice = obs_shrinking_slice.shape[1]
 
-            # fit the model to the data and get back the params
-            if self.__class__.__name__ == "LPPLSCMAES":
-                # print('cmaes fit is running!')
-                tc, m, w, a, b, c, c1, c2, O, D = self.fit(
-                    max_iteration=2500, pop_size=4, obs=obs_shrinking_slice
-                )
-            else:
-                tc, m, w, a, b, c, c1, c2, O, D = self.fit(
-                    max_searches, obs=obs_shrinking_slice
-                )
+            # Calculate absolute start/end indices relative to the original full timeseries
+            abs_start_idx = n_iter + j
+            abs_end_idx = n_iter + window_size # End index (exclusive)
 
-            nested_t1 = obs_shrinking_slice[0][0]
-            nested_t2 = obs_shrinking_slice[0][-1]
-            nested_p1 = obs_shrinking_slice[1][0]
-            nested_p2 = obs_shrinking_slice[1][-1]
+            # Ensure slice has enough points (e.g., >= 3 for matrix equation)
+            if num_points_in_slice < 3:
+                continue
 
-            # TODO consider rescaling data to be ∈ [0, 1] for perf?
-            # if self.scale_obs:
-            #     sub_t1 = self.inverse_transform_observations([[sub_t1, sub_p1]])[0, 0]
-            #     sub_t2 = self.inverse_transform_observations([[sub_t2, sub_p2]])[0, 0]
-            #     tc = self.inverse_transform_observations([[tc, 0]])[0, 0]
-
-            res.append(
-                {
-                    # "tc_d": self.ordinal_to_date(tc),
-                    "tc": tc,
-                    "m": m,
-                    "w": w,
-                    "a": a,
-                    "b": b,
-                    "c": c,
-                    "c1": c1,
-                    "c2": c2,
-                    # "t1_d": self.ordinal_to_date(nested_t1),
-                    # "t2_d": self.ordinal_to_date(nested_t2),
-                    "t1": nested_t1,
-                    "t2": nested_t2,
-                    "O": O,
-                    "D": D,
-                }
+            # Fit the model to the shrinking slice
+            tc, m, w, a, b, c, c1, c2, O, D, sse, residuals = self.fit(
+                max_searches, obs=obs_shrinking_slice
             )
 
-        # return {'t1': self.ordinal_to_date(t1), 't2': self.ordinal_to_date(t2), 'p2': p2, 'res': res}
-        return {"t1": t1, "t2": t2, "p2": p2, "res": res}
+            # Get the specific t1/t2 for this nested slice
+            nested_t1 = obs_shrinking_slice[0, 0]
+            nested_t2 = obs_shrinking_slice[0, -1] # Should match t2_outer
+
+            # Store results for this nested fit
+            fit_result_dict = {
+                "tc": tc, "m": m, "w": w, "a": a, "b": b, "c": c, "c1": c1, "c2": c2,
+                "t1": nested_t1, "t2": nested_t2, # t1/t2 of this specific nested window
+                "O": O, "D": D,
+                "sse": sse,                 # Store Sum of Squared Errors
+                "residuals": residuals,     # Store residuals array
+                "num_points": num_points_in_slice, # Store number of points in window
+                "data_start_idx": abs_start_idx,   # Store absolute start index
+                "data_end_idx": abs_end_idx,       # Store absolute end index (exclusive)
+                "status": "success" if tc != 0 else "failed" # Basic status check
+            }
+            res_inner.append(fit_result_dict)
+
+        # Return results for this outer window step
+        return {"t1": t1_outer, "t2": t2_outer, "p2": p2_outer, "res": res_inner}
 
     def _get_tc_bounds(self, obs, lower_bound_pct, upper_bound_pct):
         """
